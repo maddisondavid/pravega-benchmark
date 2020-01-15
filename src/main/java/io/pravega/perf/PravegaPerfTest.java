@@ -10,8 +10,10 @@
 
 package io.pravega.perf;
 
+import io.pravega.client.BatchClientFactory;
 import io.pravega.client.ClientConfig;
 import io.pravega.client.EventStreamClientFactory;
+import io.pravega.client.batch.SegmentRange;
 import io.pravega.client.stream.ReaderGroup;
 import io.pravega.client.stream.impl.ClientFactoryImpl;
 import io.pravega.client.stream.impl.ControllerImpl;
@@ -22,10 +24,13 @@ import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
@@ -42,6 +47,8 @@ import java.util.stream.Stream;
  * Data format is in comma separated format as following: {TimeStamp, Sensor Id, Location, TempValue }.
  */
 public class PravegaPerfTest {
+    private static Logger log = LoggerFactory.getLogger(PravegaPerfTest.class);
+
     final static String BENCHMARKNAME = "pravega-benchmark";
 
     public static void main(String[] args) {
@@ -95,6 +102,8 @@ public class PravegaPerfTest {
                 "If >0, watermarks will be read with a period of this many milliseconds.");
         options.addOption("createScope", true, "attempt to create Pravega scope(true by default)");
         options.addOption("reportingIntervalMillis", true, "period (in milliseconds) in which performance will be reported");
+
+        options.addOption("batchreaders", false, "signifies the consumers should all be Batch Readers rather than Streaming readers");
 
         options.addOption("help", false, "Help message");
 
@@ -194,7 +203,7 @@ public class PravegaPerfTest {
         final boolean recreate;
         final boolean writeAndRead;
         final int producerCount;
-        final int consumerCount;
+        int consumerCount;
         final int segmentCount;
         final int segmentScaleKBps;
         final int segmentScaleEventsPerSecond;
@@ -217,11 +226,9 @@ public class PravegaPerfTest {
         final boolean enableConnectionPooling;
         final long writeWatermarkPeriodMillis;
         final long readWatermarkPeriodMillis;
-<<<<<<< HEAD
         final boolean createScope;
-=======
         final int reportingInterval;
->>>>>>> issue-87-add-throughput-recorder
+        final boolean batchReaders;
 
         Test(long startTime, CommandLine commandline) throws IllegalArgumentException {
             this.startTime = startTime;
@@ -289,6 +296,12 @@ public class PravegaPerfTest {
                 reportingInterval = Integer.parseInt(commandline.getOptionValue("reportingIntervalMillis"));
             } else {
                 reportingInterval = DEFAULT_REPORTING_INTERVAL;
+            }
+
+            if (commandline.hasOption("batchreaders")) {
+                batchReaders = true;
+            } else {
+                batchReaders = false;
             }
 
             enableConnectionPooling = Boolean.parseBoolean(commandline.getOptionValue("enableConnectionPooling", "true"));
@@ -415,6 +428,7 @@ public class PravegaPerfTest {
         final PravegaStreamHandler streamHandle;
         final EventStreamClientFactory factory;
         final ReaderGroup readerGroup;
+        final BatchClientFactory batchClientFactory;
 
         PravegaTest(long startTime, CommandLine commandline) throws Exception {
             super(startTime, commandline);
@@ -436,8 +450,15 @@ public class PravegaPerfTest {
             }
 
             if (consumerCount > 0) {
-                readerGroup = streamHandle.createReaderGroup(!writeAndRead);
+                if (batchReaders) {
+                    batchClientFactory = streamHandle.newBatchClientFactory();
+                    readerGroup = null;
+                } else {
+                    batchClientFactory = null;
+                    readerGroup = streamHandle.createReaderGroup(!writeAndRead);
+                }
             } else {
+                batchClientFactory = null;
                 readerGroup = null;
             }
 
@@ -478,11 +499,43 @@ public class PravegaPerfTest {
         }
 
         public List<ReaderWorker> getConsumers() throws URISyntaxException {
+            return batchReaders ? getBatchConsumers() : getStreamingConsumers();
+        }
+
+        public List<ReaderWorker> getBatchConsumers() {
+            final List<ReaderWorker> readers;
+            if (consumerCount > 0) {
+                List<SegmentRange> segmentRanges = streamHandle.getBatchSegmentRanges(batchClientFactory);
+
+                if (consumerCount > segmentRanges.size()) {
+                    consumerCount = segmentRanges.size();
+
+                    log.info("Limiting To {} consumers due to small number of segment ranges", consumerCount);
+                }
+
+                List<List<SegmentRange>> assignedRanges = assignSegmentsToConsumers(segmentRanges, consumerCount);
+
+                readers = IntStream.range(0, consumerCount)
+                    .boxed()
+                    .map(i ->
+                        new PravegaBatchReaderWorker(i, eventsPerConsumer,
+                        runtimeSec, startTime, consumeStats,
+                        rdGrpName, TIMEOUT, writeAndRead, batchClientFactory, assignedRanges.get(i))
+                    )
+                    .collect(Collectors.toList());
+            } else {
+                readers = null;
+            }
+            return readers;
+
+        }
+
+        public List<ReaderWorker> getStreamingConsumers() throws URISyntaxException {
             final List<ReaderWorker> readers;
             if (consumerCount > 0) {
                 readers = IntStream.range(0, consumerCount)
                         .boxed()
-                        .map(i -> new PravegaReaderWorker(i, eventsPerConsumer,
+                        .map(i -> new PravegaStreamingReaderWorker(i, eventsPerConsumer,
                                 runtimeSec, startTime, consumeStats,
                                 rdGrpName, TIMEOUT, writeAndRead, factory,
                                 io.pravega.client.stream.Stream.of(scopeName, streamName),
@@ -501,5 +554,33 @@ public class PravegaPerfTest {
             }
         }
 
+        /**
+         * Chunks the list of segment ranges between the number consumers.  If the number of segment ranges is
+         * divisible by the number of consumers then each consumer will recieve an equal number of segments, otherwise
+         * some consumers may receive more segments than others.
+         *
+         * @return A list of lists, each list representing the segments assigned to that consumer
+         */
+        private List<List<SegmentRange>> assignSegmentsToConsumers(List<SegmentRange> segmentRanges, int consumers) {
+            List<List<SegmentRange>> results = new ArrayList<>();
+            for (int f=0;f<consumers;f++) {
+                results.add(new ArrayList<>());
+            }
+
+            for (int f=0;f < segmentRanges.size(); f++) {
+                int consumerId = f % consumers;
+
+                if (results.size() < f) {
+                    results.add(new ArrayList<>());
+                }
+
+                SegmentRange segmentRange = segmentRanges.get(f);
+                results.get(consumerId).add(segmentRange);
+
+                log.info("Segment Assignment {} -> {} {}({}:{})", consumerId, segmentRange.getStreamName(), segmentRange.getSegmentId(), segmentRange.getStartOffset(), segmentRange.getEndOffset());
+            }
+
+            return results;
+        }
     }
 }
